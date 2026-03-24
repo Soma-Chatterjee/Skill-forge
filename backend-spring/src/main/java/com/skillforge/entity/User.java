@@ -1,0 +1,281 @@
+package com.skillforge.entity;
+
+import jakarta.persistence.*;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDateTime;
+
+/**
+ * User Entity - Maps to PostgreSQL users table
+ * Replaces MongoDB User schema.
+ * 
+ * Matches original Express User model exactly with equivalent fields and validations.
+ */
+@Entity
+@Table(name = "users", uniqueConstraints = {
+    @UniqueConstraint(columnNames = "email")
+})
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 200)
+    private String name;
+
+    @Column(nullable = false, unique = true, length = 255)
+    private String email;
+
+    @Column(length = 2000)
+    private String avatar;
+
+    @Column(length = 4000)
+    private String bio;
+
+    @Column(length = 500)
+    private String linkedin;
+
+    @Column(length = 500)
+    private String github;
+
+    @Column(nullable = false)
+    private String passwordHash;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private UserRole role;
+
+    @CreationTimestamp
+    @Column(nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(nullable = false)
+    private LocalDateTime lastActivityAt;
+
+    @UpdateTimestamp
+    @Column(nullable = false)
+    private LocalDateTime updatedAt;
+
+    // Constructors
+    public User() {
+    }
+
+    public User(String name, String email, String passwordHash, UserRole role) {
+        this.name = name;
+        this.email = email;
+        this.passwordHash = passwordHash;
+        this.role = role;
+    }
+
+    public User(Long id, String name, String email, String passwordHash, UserRole role, LocalDateTime lastActivityAt) {
+        this.id = id;
+        this.name = name;
+        this.email = email;
+        this.passwordHash = passwordHash;
+        this.role = role;
+        this.lastActivityAt = lastActivityAt;
+    }
+
+    // Getters and Setters
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    public String getAvatar() {
+        return avatar;
+    }
+
+    public void setAvatar(String avatar) {
+        this.avatar = avatar;
+    }
+
+    public String getBio() {
+        return bio;
+    }
+
+    public void setBio(String bio) {
+        this.bio = bio;
+    }
+
+    public String getLinkedin() {
+        return linkedin;
+    }
+
+    public void setLinkedin(String linkedin) {
+        this.linkedin = linkedin;
+    }
+
+    public String getGithub() {
+        return github;
+    }
+
+    public void setGithub(String github) {
+        this.github = github;
+    }
+
+    public String getPasswordHash() {
+        return passwordHash;
+    }
+
+    public void setPasswordHash(String passwordHash) {
+        this.passwordHash = passwordHash;
+    }
+
+    public UserRole getRole() {
+        return role;
+    }
+
+    public void setRole(UserRole role) {
+        this.role = role;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
+    }
+
+    public LocalDateTime getLastActivityAt() {
+        return lastActivityAt;
+    }
+
+    public void setLastActivityAt(LocalDateTime lastActivityAt) {
+        this.lastActivityAt = lastActivityAt;
+    }
+
+    public LocalDateTime getUpdatedAt() {
+        return updatedAt;
+    }
+
+    public void setUpdatedAt(LocalDateTime updatedAt) {
+        this.updatedAt = updatedAt;
+    }
+
+    /**
+     * Called before persisting to set initial lastActivityAt if not set.
+     */
+    @PrePersist
+    protected void onCreate() {
+        if (this.lastActivityAt == null) {
+            this.lastActivityAt = LocalDateTime.now();
+        }
+    }
+
+    /**
+     * User role enum: STUDENT, COURSE_ADMIN, SUPER_ADMIN, ADMIN
+     * SUPER_ADMIN = Full platform access
+     * ADMIN = Legacy compatibility alias for SUPER_ADMIN
+     * COURSE_ADMIN = Can manage assigned courses only
+     * STUDENT = Standard student access
+     */
+    public enum UserRole {
+        STUDENT, COURSE_ADMIN, SUPER_ADMIN, ADMIN
+    }
+
+    // Builder pattern
+    public static UserBuilder builder() {
+        return new UserBuilder();
+    }
+
+    public static class UserBuilder {
+        private Long id;
+        private String name;
+        private String email;
+        private String avatar;
+        private String bio;
+        private String linkedin;
+        private String github;
+        private String passwordHash;
+        private UserRole role;
+        private LocalDateTime lastActivityAt;
+
+        public UserBuilder id(Long id) {
+            this.id = id;
+            return this;
+        }
+
+        public UserBuilder name(String name) {
+            this.name = name;
+            return this;
+        }
+
+        public UserBuilder email(String email) {
+            this.email = email;
+            return this;
+        }
+
+        public UserBuilder avatar(String avatar) {
+            this.avatar = avatar;
+            return this;
+        }
+
+        public UserBuilder bio(String bio) {
+            this.bio = bio;
+            return this;
+        }
+
+        public UserBuilder linkedin(String linkedin) {
+            this.linkedin = linkedin;
+            return this;
+        }
+
+        public UserBuilder github(String github) {
+            this.github = github;
+            return this;
+        }
+
+        public UserBuilder passwordHash(String passwordHash) {
+            this.passwordHash = passwordHash;
+            return this;
+        }
+
+        public UserBuilder role(UserRole role) {
+            this.role = role;
+            return this;
+        }
+
+        public UserBuilder lastActivityAt(LocalDateTime lastActivityAt) {
+            this.lastActivityAt = lastActivityAt;
+            return this;
+        }
+
+        public User build() {
+            User user = new User();
+            user.id = this.id;
+            user.name = this.name;
+            user.email = this.email;
+            user.avatar = this.avatar;
+            user.bio = this.bio;
+            user.linkedin = this.linkedin;
+            user.github = this.github;
+            user.passwordHash = this.passwordHash;
+            user.role = this.role;
+            user.lastActivityAt = this.lastActivityAt != null ? this.lastActivityAt : LocalDateTime.now();
+            return user;
+        }
+    }
+}

@@ -1,0 +1,687 @@
+package com.skillforge.service;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.skillforge.dto.CourseDTO;
+import com.skillforge.dto.ProgressDTO;
+import com.skillforge.dto.GeneratedExamDTO;
+import com.skillforge.entity.Course;
+import com.skillforge.entity.CourseAdminAssignment;
+import com.skillforge.entity.Enrollment;
+import com.skillforge.entity.Progress;
+import com.skillforge.entity.QuizAttempt;
+import com.skillforge.entity.User;
+import com.skillforge.repository.CourseAdminAssignmentRepository;
+import com.skillforge.repository.CourseRepository;
+import com.skillforge.repository.EnrollmentRepository;
+import com.skillforge.repository.ProgressRepository;
+import com.skillforge.repository.QuizAttemptRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.lang.reflect.Type;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Progress Service - Handles learning progress tracking
+ * 
+ * Operations:
+ * - Mark module as complete
+ * - Get user's progress across all courses
+ * - Submit quiz attempts
+ */
+@Service
+public class ProgressService {
+    
+    private static final Logger log = LoggerFactory.getLogger(ProgressService.class);
+    private static final int MAX_PROCTORING_VIOLATIONS = 3;
+
+    @Autowired
+    private ProgressRepository progressRepository;
+
+    @Autowired
+    private QuizAttemptRepository quizAttemptRepository;
+
+    @Autowired
+    private EnrollmentRepository enrollmentRepository;
+
+    @Autowired
+    private CourseRepository courseRepository;
+
+    @Autowired
+    private CourseAdminAssignmentRepository courseAdminAssignmentRepository;
+
+    @Autowired
+    private CourseExamService courseExamService;
+
+    private static final Gson gson = new Gson();
+
+    /**
+     * Mark a module as complete
+     * 
+     * Validations:
+     * - User must be enrolled in the course
+     * - If progress doesn't exist, create it
+     * - If already completed, update completedAt timestamp
+     * 
+     * @param userId User ID (from JWT)
+     * @param courseId Course ID
+     * @param moduleId Module ID
+     * @return ProgressDTO
+     * @throws IllegalArgumentException if validation fails
+     */
+    public ProgressDTO markModuleComplete(Long userId, String courseId, String moduleId) {
+        // Parse course ID
+        Long parsedCourseId;
+        try {
+            parsedCourseId = Long.parseLong(courseId);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid course ID");
+        }
+
+        // Verify enrollment
+        boolean isEnrolled = enrollmentRepository.existsByUserIdAndCourseId(userId, parsedCourseId);
+        if (!isEnrolled) {
+            throw new IllegalArgumentException("Not enrolled in this course");
+        }
+
+        // Get or create progress record
+        Progress progress = progressRepository
+                .findByUserIdAndCourseIdAndModuleId(userId, parsedCourseId, moduleId)
+                .orElse(null);
+
+        if (progress == null) {
+            // Create new progress record
+            progress = new Progress();
+            
+            // Simplified approach: fetch user and course
+            var user = new com.skillforge.entity.User();
+            user.setId(userId);
+            var course = new Course();
+            course.setId(parsedCourseId);
+            
+            progress.setUser(user);
+            progress.setCourse(course);
+            progress.setModuleId(moduleId);
+            progress.setCompleted(true);
+            progress.setCompletedAt(LocalDateTime.now());
+        } else {
+            // Update existing progress
+            if (!progress.getCompleted()) {
+                progress.setCompleted(true);
+                progress.setCompletedAt(LocalDateTime.now());
+            }
+        }
+
+        progress = progressRepository.save(progress);
+        log.info("User {} marked module {} complete in course {}", userId, moduleId, parsedCourseId);
+
+        return convertProgressToDTO(progress);
+    }
+
+    /**
+     * Get user's learning progress across all enrolled courses
+     * Groups progress by course with metrics:
+     * - Total modules
+     * - Completed modules
+     * - Completion percentage
+     * 
+     * @param userId User ID (from JWT)
+     * @return Map of course data with progress metrics
+     */
+    public ProgressSummaryResponse getMyProgress(Long userId) {
+        // Get all progress for user
+        List<Progress> allProgress = progressRepository.findAllByUserId(userId);
+        Map<Long, List<Progress>> progressByCourseId = allProgress.stream()
+            .collect(Collectors.groupingBy(p -> p.getCourse().getId()));
+
+        // Build summaries for all enrolled courses (including 0% progress)
+        List<Enrollment> enrollments = enrollmentRepository.findAllByUserIdOrderByEnrolledAtDesc(userId);
+        List<ProgressSummaryItem> summaries = enrollments.stream()
+            .map(enrollment -> {
+                Course course = enrollment.getCourse();
+                List<Progress> courseProgress = progressByCourseId.getOrDefault(course.getId(), List.of());
+
+                List<CourseDTO.ModuleDTO> courseModules = parseCourseModules(course);
+                Set<String> courseModuleIds = resolveModuleIds(courseModules);
+
+                Set<String> completedModuleIds = courseProgress.stream()
+                    .filter(progress -> Boolean.TRUE.equals(progress.getCompleted()))
+                    .map(Progress::getModuleId)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toSet());
+
+                int totalModules = courseModuleIds.size();
+                int completedModules = (int) courseModuleIds.stream()
+                    .filter(completedModuleIds::contains)
+                    .count();
+                double completionPercentage = totalModules > 0
+                    ? (completedModules * 100.0) / totalModules
+                    : 0.0;
+
+                return ProgressSummaryItem.builder()
+                    .course(convertCourseToDTOWithParsedData(course))
+                    .totalModules(totalModules)
+                    .completedModules(completedModules)
+                    .completionPercentage(completionPercentage)
+                    .modules(courseProgress.stream()
+                        .map(this::convertProgressToDTO)
+                        .collect(Collectors.toList()))
+                    .build();
+            })
+            .collect(Collectors.toList());
+
+        return ProgressSummaryResponse.builder()
+                .count(summaries.size())
+                .summary(summaries)
+                .build();
+    }
+
+    /**
+     * Submit a quiz attempt
+     * 
+     * Scoring: Each correct answer = 10 points (max 100)
+     * Pass: score >= 60
+     * 
+     * @param userId User ID (from JWT)
+     * @param courseId Course ID
+     * @param moduleId Module ID
+     * @param answers Array of correct/incorrect answers
+     * @param timeTakenSec Time taken to complete quiz (seconds)
+     * @return QuizSubmitResponseDTO with score, pass status, and feedback
+     * @throws IllegalArgumentException if validation fails
+     */
+    public QuizSubmitResponse submitQuiz(Long userId, String courseId, String moduleId,
+                                         List<Boolean> answers, Long timeTakenSec) {
+        return submitQuiz(userId, courseId, moduleId, answers, null, timeTakenSec, null, null, null, null);
+    }
+
+    public QuizSubmitResponse submitQuiz(Long userId, String courseId, String moduleId,
+                                         List<Boolean> answers, Long timeTakenSec,
+                                         Integer proctoringViolationCount,
+                                         Boolean proctoringConfirmed) {
+        return submitQuiz(userId, courseId, moduleId, answers, null, timeTakenSec,
+                proctoringViolationCount, proctoringConfirmed, null, null);
+    }
+
+    public QuizSubmitResponse submitQuiz(Long userId, String courseId, String moduleId,
+                                         List<Boolean> answers, List<Integer> selectedAnswers,
+                                         Long timeTakenSec,
+                                         Integer proctoringViolationCount,
+                                         Boolean proctoringConfirmed,
+                                         String proctoringFailureReason,
+                                         Boolean proctoringFailed) {
+        // Validations
+        if (courseId == null || moduleId == null) {
+            throw new IllegalArgumentException("courseId and moduleId are required");
+        }
+
+        Long parsedCourseId;
+        try {
+            parsedCourseId = Long.parseLong(courseId);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid course ID");
+        }
+
+        // Verify enrollment
+        boolean isEnrolled = enrollmentRepository.existsByUserIdAndCourseId(userId, parsedCourseId);
+        if (!isEnrolled) {
+            throw new IllegalArgumentException("Not enrolled in this course");
+        }
+
+        Course course = courseRepository.findById(parsedCourseId)
+                .orElseThrow(() -> new IllegalArgumentException("Course not found"));
+
+        double completionPercentage = calculateCompletionPercentage(userId, course);
+        if (completionPercentage < 100.0) {
+            throw new IllegalArgumentException("Complete 100% of course content before attempting exam");
+        }
+
+        if (Boolean.FALSE.equals(proctoringConfirmed)) {
+            throw new IllegalArgumentException("Proctoring consent is required to submit exam");
+        }
+
+        int violationCount = Math.max(0, proctoringViolationCount != null ? proctoringViolationCount : 0);
+        boolean failedByProctoring = Boolean.TRUE.equals(proctoringFailed) || violationCount >= MAX_PROCTORING_VIOLATIONS;
+        if (Boolean.TRUE.equals(proctoringFailed) && violationCount < MAX_PROCTORING_VIOLATIONS) {
+            violationCount = MAX_PROCTORING_VIOLATIONS;
+        }
+
+        if (!failedByProctoring && (answers == null && selectedAnswers == null)) {
+            throw new IllegalArgumentException("answers are required unless proctoring already failed");
+        }
+
+        String normalizedProctoringFailureReason = null;
+        int score;
+        boolean passed;
+
+        if (failedByProctoring) {
+            score = 0;
+            passed = false;
+            normalizedProctoringFailureReason = (proctoringFailureReason != null && !proctoringFailureReason.isBlank())
+                    ? proctoringFailureReason.trim()
+                    : "MAX_VIOLATIONS_REACHED: Proctoring policy violation threshold exceeded";
+        } else {
+            List<Boolean> gradedAnswers = answers;
+            if (gradedAnswers == null && selectedAnswers != null) {
+                gradedAnswers = courseExamService.gradeAnswers(parsedCourseId, selectedAnswers);
+            }
+
+            if (gradedAnswers == null) {
+                throw new IllegalArgumentException("Unable to grade exam answers");
+            }
+
+            int totalQuestions = Math.max(gradedAnswers.size(), 1);
+            int correctCount = (int) gradedAnswers.stream().filter(Boolean::booleanValue).count();
+            score = (int) Math.round((correctCount * 100.0) / totalQuestions);
+            passed = score >= 60;
+        }
+
+        // Create quiz attempt
+        var user = new com.skillforge.entity.User();
+        user.setId(userId);
+
+        QuizAttempt attempt = QuizAttempt.builder()
+                .user(user)
+                .course(course)
+                .moduleId(moduleId)
+                .score(score)
+                .timeTakenSec(timeTakenSec != null ? timeTakenSec : 0)
+                .passed(passed)
+                .proctoringViolationCount(violationCount)
+                .proctoringFailed(failedByProctoring)
+                .proctoringFailureReason(normalizedProctoringFailureReason)
+                .build();
+
+        attempt = quizAttemptRepository.save(attempt);
+            log.info("Quiz submitted by user {} for module {} - Score: {}, Proctoring violations: {}, Proctoring failed: {}",
+                userId, moduleId, score, violationCount, failedByProctoring);
+
+            String feedback;
+            if (failedByProctoring) {
+                feedback = "Exam failed due to proctoring policy violation.";
+            } else {
+                feedback = passed ? "Great job!" : "Try again to improve your score.";
+            }
+        
+        return QuizSubmitResponse.builder()
+                .score(score)
+                .passed(passed)
+                .feedback(feedback)
+                .attemptId(attempt.getId())
+                .proctoringFailed(failedByProctoring)
+                .proctoringFailureReason(normalizedProctoringFailureReason)
+                .build();
+    }
+
+    private double calculateCompletionPercentage(Long userId, Course course) {
+        Set<String> courseModuleIds = resolveModuleIds(parseCourseModules(course));
+        int totalModules = courseModuleIds.size();
+        if (totalModules == 0) {
+            return 0.0;
+        }
+
+        Set<String> completedModuleIds = progressRepository.findCompletedModulesByUserAndCourse(userId, course.getId())
+            .stream()
+            .map(Progress::getModuleId)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toSet());
+
+        long completedCount = courseModuleIds.stream()
+            .filter(completedModuleIds::contains)
+            .count();
+
+        return (completedCount * 100.0) / totalModules;
+    }
+
+    private List<CourseDTO.ModuleDTO> parseCourseModules(Course course) {
+        Type moduleListType = new TypeToken<List<CourseDTO.ModuleDTO>>() {}.getType();
+        return course.getSyllabusModules() != null
+                ? gson.fromJson(course.getSyllabusModules(), moduleListType)
+                : List.of();
+    }
+
+    private Set<String> resolveModuleIds(List<CourseDTO.ModuleDTO> modules) {
+        Set<String> moduleIds = new LinkedHashSet<>();
+        for (int index = 0; index < modules.size(); index++) {
+            CourseDTO.ModuleDTO module = modules.get(index);
+            String moduleId = module != null ? module.getId() : null;
+            if (moduleId == null || moduleId.isBlank()) {
+                moduleId = "mod-" + index;
+            }
+            moduleIds.add(moduleId);
+        }
+        return moduleIds;
+    }
+
+    /**
+     * Convert Progress entity to ProgressDTO
+     */
+    private ProgressDTO convertProgressToDTO(Progress progress) {
+        return ProgressDTO.builder()
+                .id(progress.getId())
+                .userId(progress.getUser().getId())
+                .courseId(convertCourseToDTOWithParsedData(progress.getCourse()))
+                .moduleId(progress.getModuleId())
+                .completed(progress.getCompleted())
+                .completedAt(progress.getCompletedAt())
+                .createdAt(progress.getCreatedAt())
+                .updatedAt(progress.getUpdatedAt())
+                .build();
+    }
+
+    /**
+     * Convert Course to CourseDTO with parsed JSON
+     */
+    private CourseDTO convertCourseToDTOWithParsedData(Course course) {
+        Type stringListType = new TypeToken<List<String>>(){}.getType();
+        Type moduleListType = new TypeToken<List<CourseDTO.ModuleDTO>>(){}.getType();
+        Type longListType = new TypeToken<List<Long>>(){}.getType();
+
+        List<String> tags = course.getTags() != null ? 
+                gson.fromJson(course.getTags(), stringListType) : List.of();
+        List<CourseDTO.ModuleDTO> modules = course.getSyllabusModules() != null ?
+                gson.fromJson(course.getSyllabusModules(), moduleListType) : List.of();
+        List<Long> prerequisites = course.getPrerequisites() != null ?
+                gson.fromJson(course.getPrerequisites(), longListType) : List.of();
+        List<CourseAdminAssignment> assignments = courseAdminAssignmentRepository.findByCourseId(course.getId());
+        CourseAdminAssignment primaryAssignment = assignments.isEmpty() ? null : assignments.get(0);
+
+        return CourseDTO.builder()
+                .id(course.getId())
+                .title(course.getTitle())
+                .slug(course.getSlug())
+                .category(course.getCategory().name())
+                .level(course.getLevel().name())
+                .durationHours(course.getDurationHours())
+                .rating(course.getRating())
+                .thumbnailUrl(course.getThumbnailUrl())
+                .description(course.getDescription())
+                .instructor(primaryAssignment != null ? primaryAssignment.getAdmin().getName() : "SkillForge Faculty")
+                .assignedInstructorId(primaryAssignment != null ? primaryAssignment.getAdmin().getId() : null)
+                .instructorAvatar(primaryAssignment != null ? primaryAssignment.getAdmin().getAvatar() : null)
+                .instructorBio(primaryAssignment != null ? primaryAssignment.getAdmin().getBio() : null)
+                .instructorLinkedin(primaryAssignment != null ? primaryAssignment.getAdmin().getLinkedin() : null)
+                .instructorGithub(primaryAssignment != null ? primaryAssignment.getAdmin().getGithub() : null)
+                .tags(tags)
+                .syllabusModules(modules)
+                .prerequisites(prerequisites)
+                .createdAt(course.getCreatedAt())
+                .updatedAt(course.getUpdatedAt())
+                .build();
+    }
+
+    public static class ProgressSummaryResponse {
+        private int count;
+        private List<ProgressSummaryItem> summary;
+
+        public ProgressSummaryResponse() {
+        }
+
+        public ProgressSummaryResponse(int count, List<ProgressSummaryItem> summary) {
+            this.count = count;
+            this.summary = summary;
+        }
+
+        public int getCount() {
+            return count;
+        }
+
+        public void setCount(int count) {
+            this.count = count;
+        }
+
+        public List<ProgressSummaryItem> getSummary() {
+            return summary;
+        }
+
+        public void setSummary(List<ProgressSummaryItem> summary) {
+            this.summary = summary;
+        }
+
+        public static ProgressSummaryResponseBuilder builder() {
+            return new ProgressSummaryResponseBuilder();
+        }
+
+        public static class ProgressSummaryResponseBuilder {
+            private int count;
+            private List<ProgressSummaryItem> summary;
+
+            public ProgressSummaryResponseBuilder count(int count) {
+                this.count = count;
+                return this;
+            }
+
+            public ProgressSummaryResponseBuilder summary(List<ProgressSummaryItem> summary) {
+                this.summary = summary;
+                return this;
+            }
+
+            public ProgressSummaryResponse build() {
+                return new ProgressSummaryResponse(count, summary);
+            }
+        }
+    }
+
+    public static class ProgressSummaryItem {
+        private CourseDTO course;
+        private Integer totalModules;
+        private Integer completedModules;
+        private Double completionPercentage;
+        private List<ProgressDTO> modules;
+
+        public ProgressSummaryItem() {
+        }
+
+        public ProgressSummaryItem(CourseDTO course, Integer totalModules, Integer completedModules, 
+                                   Double completionPercentage, List<ProgressDTO> modules) {
+            this.course = course;
+            this.totalModules = totalModules;
+            this.completedModules = completedModules;
+            this.completionPercentage = completionPercentage;
+            this.modules = modules;
+        }
+
+        public CourseDTO getCourse() {
+            return course;
+        }
+
+        public void setCourse(CourseDTO course) {
+            this.course = course;
+        }
+
+        public Integer getTotalModules() {
+            return totalModules;
+        }
+
+        public void setTotalModules(Integer totalModules) {
+            this.totalModules = totalModules;
+        }
+
+        public Integer getCompletedModules() {
+            return completedModules;
+        }
+
+        public void setCompletedModules(Integer completedModules) {
+            this.completedModules = completedModules;
+        }
+
+        public Double getCompletionPercentage() {
+            return completionPercentage;
+        }
+
+        public void setCompletionPercentage(Double completionPercentage) {
+            this.completionPercentage = completionPercentage;
+        }
+
+        public List<ProgressDTO> getModules() {
+            return modules;
+        }
+
+        public void setModules(List<ProgressDTO> modules) {
+            this.modules = modules;
+        }
+
+        public static ProgressSummaryItemBuilder builder() {
+            return new ProgressSummaryItemBuilder();
+        }
+
+        public static class ProgressSummaryItemBuilder {
+            private CourseDTO course;
+            private Integer totalModules;
+            private Integer completedModules;
+            private Double completionPercentage;
+            private List<ProgressDTO> modules;
+
+            public ProgressSummaryItemBuilder course(CourseDTO course) {
+                this.course = course;
+                return this;
+            }
+
+            public ProgressSummaryItemBuilder totalModules(Integer totalModules) {
+                this.totalModules = totalModules;
+                return this;
+            }
+
+            public ProgressSummaryItemBuilder completedModules(Integer completedModules) {
+                this.completedModules = completedModules;
+                return this;
+            }
+
+            public ProgressSummaryItemBuilder completionPercentage(Double completionPercentage) {
+                this.completionPercentage = completionPercentage;
+                return this;
+            }
+
+            public ProgressSummaryItemBuilder modules(List<ProgressDTO> modules) {
+                this.modules = modules;
+                return this;
+            }
+
+            public ProgressSummaryItem build() {
+                return new ProgressSummaryItem(course, totalModules, completedModules, completionPercentage, modules);
+            }
+        }
+    }
+
+    public static class QuizSubmitResponse {
+        private Integer score;
+        private Boolean passed;
+        private String feedback;
+        private Long attemptId;
+        private Boolean proctoringFailed;
+        private String proctoringFailureReason;
+
+        public QuizSubmitResponse() {
+        }
+
+        public QuizSubmitResponse(Integer score, Boolean passed, String feedback, Long attemptId,
+                                  Boolean proctoringFailed, String proctoringFailureReason) {
+            this.score = score;
+            this.passed = passed;
+            this.feedback = feedback;
+            this.attemptId = attemptId;
+            this.proctoringFailed = proctoringFailed;
+            this.proctoringFailureReason = proctoringFailureReason;
+        }
+
+        public Integer getScore() {
+            return score;
+        }
+
+        public void setScore(Integer score) {
+            this.score = score;
+        }
+
+        public Boolean getPassed() {
+            return passed;
+        }
+
+        public void setPassed(Boolean passed) {
+            this.passed = passed;
+        }
+
+        public String getFeedback() {
+            return feedback;
+        }
+
+        public void setFeedback(String feedback) {
+            this.feedback = feedback;
+        }
+
+        public Long getAttemptId() {
+            return attemptId;
+        }
+
+        public void setAttemptId(Long attemptId) {
+            this.attemptId = attemptId;
+        }
+
+        public Boolean getProctoringFailed() {
+            return proctoringFailed;
+        }
+
+        public void setProctoringFailed(Boolean proctoringFailed) {
+            this.proctoringFailed = proctoringFailed;
+        }
+
+        public String getProctoringFailureReason() {
+            return proctoringFailureReason;
+        }
+
+        public void setProctoringFailureReason(String proctoringFailureReason) {
+            this.proctoringFailureReason = proctoringFailureReason;
+        }
+
+        public static QuizSubmitResponseBuilder builder() {
+            return new QuizSubmitResponseBuilder();
+        }
+
+        public static class QuizSubmitResponseBuilder {
+            private Integer score;
+            private Boolean passed;
+            private String feedback;
+            private Long attemptId;
+            private Boolean proctoringFailed;
+            private String proctoringFailureReason;
+
+            public QuizSubmitResponseBuilder score(Integer score) {
+                this.score = score;
+                return this;
+            }
+
+            public QuizSubmitResponseBuilder passed(Boolean passed) {
+                this.passed = passed;
+                return this;
+            }
+
+            public QuizSubmitResponseBuilder feedback(String feedback) {
+                this.feedback = feedback;
+                return this;
+            }
+
+            public QuizSubmitResponseBuilder attemptId(Long attemptId) {
+                this.attemptId = attemptId;
+                return this;
+            }
+
+            public QuizSubmitResponseBuilder proctoringFailed(Boolean proctoringFailed) {
+                this.proctoringFailed = proctoringFailed;
+                return this;
+            }
+
+            public QuizSubmitResponseBuilder proctoringFailureReason(String proctoringFailureReason) {
+                this.proctoringFailureReason = proctoringFailureReason;
+                return this;
+            }
+
+            public QuizSubmitResponse build() {
+                return new QuizSubmitResponse(score, passed, feedback, attemptId, proctoringFailed, proctoringFailureReason);
+            }
+        }
+    }
+}

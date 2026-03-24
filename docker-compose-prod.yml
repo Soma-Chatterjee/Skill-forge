@@ -1,0 +1,158 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: skillforge-postgres
+    environment:
+      POSTGRES_DB: skillforge_prod
+      POSTGRES_USER: skillforge_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-skillforge_default_123}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skillforge_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - skillforge-network
+
+  # One-shot DB backup utility (run with --profile tools)
+  db-backup:
+    image: postgres:16-alpine
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-skillforge_default_123}
+    volumes:
+      - ./backups:/backups
+    networks:
+      - skillforge-network
+    entrypoint: >
+      sh -c "mkdir -p /backups &&
+      pg_dump -h postgres -U skillforge_user -d skillforge_prod -Fc
+      -f /backups/skillforge_prod_$$(date +%Y%m%d_%H%M%S).dump"
+
+  # One-shot DB restore utility (run with --profile tools)
+  db-restore:
+    image: postgres:16-alpine
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-skillforge_default_123}
+      DB_DUMP_FILE: ${DB_DUMP_FILE:-}
+    volumes:
+      - ./backups:/backups
+    networks:
+      - skillforge-network
+    entrypoint: >
+      sh -c "test -n '$$DB_DUMP_FILE' || (echo 'Set DB_DUMP_FILE to a file under ./backups' && exit 1);
+      test -f /backups/$$DB_DUMP_FILE || (echo 'Dump file not found in /backups' && exit 1);
+      psql -h postgres -U skillforge_user -d postgres -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='skillforge_prod' AND pid <> pg_backend_pid();\";
+      psql -h postgres -U skillforge_user -d postgres -c \"DROP DATABASE IF EXISTS skillforge_prod;\";
+      psql -h postgres -U skillforge_user -d postgres -c \"CREATE DATABASE skillforge_prod;\";
+      pg_restore -h postgres -U skillforge_user -d skillforge_prod --clean --if-exists /backups/$$DB_DUMP_FILE"
+
+  # Spring Boot Backend
+  backend:
+    build:
+      context: ./backend-spring
+      dockerfile: Dockerfile
+    container_name: skillforge-backend
+    env_file:
+      - ./backend-spring/.env
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/skillforge_prod
+      SPRING_DATASOURCE_USERNAME: skillforge_user
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-skillforge_default_123}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-key-change-in-production-with-longer-key-1234567890abcdefghij}
+      ML_SERVICE_URL: http://ml-service:8000
+      MAIL_HOST: ${MAIL_HOST:-localhost}
+      MAIL_PORT: ${MAIL_PORT:-1025}
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - skillforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/swagger-ui.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: skillforge-frontend
+    environment:
+      VITE_API_URL: http://localhost:8081
+      VITE_APP_NAME: SkillForge
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - skillforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5173"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Python ML Service
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: skillforge-ml
+    environment:
+      ML_SERVICE_PORT: 8000
+      BACKEND_URL: http://backend:8081
+    ports:
+      - "8000:8000"
+    depends_on:
+      - backend
+    volumes:
+      - ./ml-service/models:/app/models
+    networks:
+      - skillforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Mail Service (MailHog for development)
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: skillforge-mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - skillforge-network
+    environment:
+      MH_SMTP_BIND_ADDR: 0.0.0.0:1025
+
+volumes:
+  postgres_prod_data:
+
+networks:
+  skillforge-network:
+    driver: bridge

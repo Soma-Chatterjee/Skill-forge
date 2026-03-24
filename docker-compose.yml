@@ -1,0 +1,52 @@
+services:
+  backend:
+    build:
+      context: ./backend-spring
+      dockerfile: Dockerfile
+    container_name: skillforge-backend
+    env_file:
+      - ./backend-spring/.env
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SERVER_PORT: 8081
+      ML_BASE_URL: http://ml-service:8000
+    volumes:
+      - backend_data:/app/data
+      - ./backend-spring/logs:/app/logs
+    networks:
+      - skillforge-network
+
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: skillforge-ml
+    ports:
+      - "8000:8000"
+    environment:
+      BACKEND_URL: http://backend:8081
+    depends_on:
+      - backend
+    networks:
+      - skillforge-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: skillforge-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - skillforge-network
+
+volumes:
+  backend_data:
+
+networks:
+  skillforge-network:
+    driver: bridge
