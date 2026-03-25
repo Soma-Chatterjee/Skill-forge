@@ -39,6 +39,8 @@ services:
     container_name: skillforge-frontend
     ports:
       - "5173:5173"
+    environment:
+      VITE_API_URL: http://backend:8081
     depends_on:
       - backend
     networks:

@@ -26,16 +26,16 @@ public class SchemaMigrationConfig {
     public void ensureCourseStatusColumn() {
         try {
             Integer statusColumnCount = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'COURSES' AND COLUMN_NAME = 'STATUS'",
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'courses' AND COLUMN_NAME = 'status'",
                     Integer.class
             );
 
             if (statusColumnCount == null || statusColumnCount == 0) {
-                jdbcTemplate.execute("ALTER TABLE COURSES ADD COLUMN STATUS VARCHAR(20) DEFAULT 'DRAFT' NOT NULL");
-                log.info("Schema migration applied: added COURSES.STATUS column with default DRAFT");
+                jdbcTemplate.execute("ALTER TABLE courses ADD COLUMN status VARCHAR(20) DEFAULT 'DRAFT' NOT NULL");
+                log.info("Schema migration applied: added courses.status column with default DRAFT");
             } else {
-                jdbcTemplate.update("UPDATE COURSES SET STATUS = 'DRAFT' WHERE STATUS IS NULL");
-                log.info("Schema migration verified: COURSES.STATUS exists and nulls backfilled");
+                jdbcTemplate.update("UPDATE courses SET status = 'DRAFT' WHERE status IS NULL");
+                log.info("Schema migration verified: courses.status exists and nulls backfilled");
             }
         } catch (Exception e) {
             log.warn("Schema migration skipped or already applied: {}", e.getMessage());
